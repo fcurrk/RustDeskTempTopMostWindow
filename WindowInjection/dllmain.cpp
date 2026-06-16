@@ -2,9 +2,11 @@
 
 #include "pch.h"
 
+#include <algorithm>
 #include <tchar.h>
 #include <memory>
 #include <type_traits>
+#include <vector>
 
 #include "./img.h"
 #include "./bitmap_loader.h"
@@ -40,9 +42,15 @@ enum ZBID
 const TCHAR* WindowTitle = _T("RustDeskPrivacyWindow");
 const TCHAR* ClassName = _T("RustDeskPrivacyWindowClass");
 const TCHAR* DefaultBmpPath = _T("C:\\aa.bmp");
+constexpr LONG PRIVACY_BITMAP_WIDTH = 1920;
+constexpr LONG PRIVACY_BITMAP_HEIGHT = 1080;
+constexpr UINT WM_RUSTDESK_REFRESH_WINDOWS = WM_APP + 1;
+constexpr UINT WM_RUSTDESK_SHUTDOWN_WINDOWS = WM_APP + 2;
+constexpr UINT WM_RUSTDESK_SHOW_WINDOWS = WM_APP + 3;
+constexpr UINT WM_RUSTDESK_HIDE_WINDOWS = WM_APP + 4;
 
 typedef enum tagDWMWINDOWATTRIBUTE {
-	DWMWA_NCRENDERING_ENABLED,
+	DWMWA_NCRENDERING_ENABLED = 1,
 	DWMWA_NCRENDERING_POLICY,
 	DWMWA_TRANSITIONS_FORCEDISABLED,
 	DWMWA_ALLOW_NCPAINT,
@@ -73,11 +81,23 @@ typedef HWND(WINAPI* CreateWindowInBand)(_In_ DWORD dwExStyle, _In_opt_ ATOM ato
 typedef BOOL(WINAPI* SetWindowBand)(HWND hWnd, HWND hwndInsertAfter, DWORD dwBand);
 typedef BOOL(WINAPI* GetWindowBand)(HWND hWnd, PDWORD pdwBand);
 typedef HDWP(WINAPI* DeferWindowPosAndBand)(_In_ HDWP hWinPosInfo, _In_ HWND hWnd, _In_opt_ HWND hWndInsertAfter, _In_ int x, _In_ int y, _In_ int cx, _In_ int cy, _In_ UINT uFlags, DWORD band, DWORD pls);
-typedef HRESULT(WINAPI* DwmSetWindowAttribute)(HWND hwnd, DWMWINDOWATTRIBUTE dwAttribute, LPCVOID pvAttribute, DWORD cbAttribute);
+typedef HRESULT(WINAPI* DwmSetWindowAttributeFunc)(HWND hwnd, DWMWINDOWATTRIBUTE dwAttribute, LPCVOID pvAttribute, DWORD cbAttribute);
 
 typedef BOOL(WINAPI* SetBrokeredForeground)(HWND hWnd);
 
-HWND g_hwnd;
+// Window handles are owned by the privacy window thread. DllMain must not read
+// g_hwnds; it signals the thread with PostThreadMessage instead.
+std::vector<HWND> g_hwnds;
+ATOM g_privacy_window_atom = 0;
+HMODULE g_module = nullptr;
+UINT g_zbid = ZBID_DEFAULT;
+volatile LONG g_window_thread_id = 0;
+// These window-state flags are read and written only on the privacy window thread.
+bool g_refresh_pending = false;
+bool g_refreshing_windows = false;
+bool g_shutting_down_windows = false;
+bool g_show_windows_after_refresh = false;
+bool g_privacy_windows_visible = false;
 
 // TODO: Read the register table to get the path.
 // Or use hard code bitmap data.
@@ -104,7 +124,20 @@ BOOL IsWindowsVersionOrGreater(
 	DWORD build_number,
 	WORD service_pack_major,
 	WORD service_pack_minor);
-
+HRESULT SetDwmBoolWindowAttribute(HWND hwnd, DWMWINDOWATTRIBUTE attribute, BOOL enabled);
+HWND CreateWin(HMODULE hModule, UINT zbid, const TCHAR* title, const TCHAR* classname, const RECT& monitorRect);
+bool CreatePrivacyWindows(HMODULE hModule, UINT zbid, bool showWindows);
+bool RefreshPrivacyWindows(HMODULE hModule, UINT zbid);
+void SchedulePrivacyWindowRefresh();
+bool HandlePrivacyThreadMessage(UINT message);
+bool PostPrivacyThreadMessage(UINT message, bool reportError);
+DWORD GetPrivacyWindowThreadId();
+bool RemovePrivacyWindow(HWND hwnd);
+bool DestroyPrivacyWindowsFrom(size_t begin);
+HWND FailCreatedWindow(HWND hwnd, const TCHAR* caption);
+void SetPrivacyWindowsVisible(bool visible);
+void DebugLogLastError(const TCHAR* caption);
+DWORD FinishPrivacyThread(DWORD result);
 
 LRESULT CALLBACK TrashParentWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -114,7 +147,26 @@ LRESULT CALLBACK TrashParentWndProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
 		break;
 
 	case WM_DESTROY:
-		PostQuitMessage(0);
+		if (!g_refreshing_windows && !g_shutting_down_windows)
+		{
+			if (FALSE != IsWindowVisible(hwnd))
+			{
+				g_show_windows_after_refresh = true;
+			}
+			if (RemovePrivacyWindow(hwnd))
+			{
+				SchedulePrivacyWindowRefresh();
+			}
+		}
+		break;
+	case WM_DISPLAYCHANGE:
+	case WM_SETTINGCHANGE:
+		SchedulePrivacyWindowRefresh();
+		break;
+	case WM_RUSTDESK_REFRESH_WINDOWS:
+	case WM_RUSTDESK_SHOW_WINDOWS:
+	case WM_RUSTDESK_HIDE_WINDOWS:
+		(void)HandlePrivacyThreadMessage(message);
 		break;
 
 	case WM_WINDOWPOSCHANGING:
@@ -156,8 +208,8 @@ void ShowErrorMsg(const TCHAR* caption)
 
 #ifdef WINDOWINJECTION_EXPORTS
 	TCHAR buf[1024] = { 0, };
-	_sntprintf_s(buf, sizeof(buf) / sizeof(buf[0]), _TRUNCATE, _T("%s, code 0x%x"), msg, code);
-	MessageBox(NULL, buf, caption, 0);
+	_sntprintf_s(buf, sizeof(buf) / sizeof(buf[0]), _TRUNCATE, _T("%s: %s, code 0x%x\n"), caption, msg, code);
+	OutputDebugString(buf);
 #else
 	_tprintf(_T("%s: %s, code 0x%x\n"), caption, msg, code);
 #endif
@@ -175,13 +227,13 @@ void ShowBitmapLoaderErrorMsg(const TCHAR* msg, EBitmapLoader code, const TCHAR*
 		msg,
 		detail,
 		static_cast<int>(code));
-	MessageBox(NULL, buf, _T("BitmapLoader"), 0);
+	OutputDebugString(buf);
 #else
 	_tprintf(_T("BitmapLoader: %s, %s, code %d\n"), msg, detail, static_cast<int>(code));
 #endif
 }
 
-HWND CreateWin(HMODULE hModule, UINT zbid, const TCHAR* title, const TCHAR* classname)
+HWND CreateWin(HMODULE hModule, UINT zbid, const TCHAR* title, const TCHAR* classname, const RECT& monitorRect)
 {
 	HINSTANCE hInstance = hModule;
 	WNDCLASSEX wndParentClass;
@@ -196,20 +248,25 @@ HWND CreateWin(HMODULE hModule, UINT zbid, const TCHAR* title, const TCHAR* clas
 	wndParentClass.hInstance = hInstance;
 	wndParentClass.style = CS_HREDRAW | CS_VREDRAW;
 	wndParentClass.hCursor = LoadCursor(0, IDC_ARROW);
-	wndParentClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+	wndParentClass.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
 	wndParentClass.lpszClassName = classname;
 
-	auto res = RegisterClassEx(&wndParentClass);
-	if (res == 0)
+	auto class_atom = g_privacy_window_atom;
+	if (class_atom == 0)
 	{
-		ShowErrorMsg(_T("RegisterClassEx"));
-		return nullptr;
+		class_atom = RegisterClassEx(&wndParentClass);
+		if (class_atom == 0)
+		{
+			ShowErrorMsg(_T("RegisterClassEx"));
+			return nullptr;
+		}
+		g_privacy_window_atom = class_atom;
 	}
 
-	const auto hpath = LoadLibrary(_T("user32.dll"));
+	const auto hpath = GetModuleHandle(_T("user32.dll"));
 	if (hpath == 0)
 	{
-		ShowErrorMsg(_T("LoadLibrary user32.dll"));
+		ShowErrorMsg(_T("GetModuleHandle user32.dll"));
 		return nullptr;
 	}
 
@@ -222,14 +279,14 @@ HWND CreateWin(HMODULE hModule, UINT zbid, const TCHAR* title, const TCHAR* clas
 
 	HWND hwnd = pCreateWindowInBand(
 		WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-		res,
+		class_atom,
 		NULL,
 		0x80000000,
 		0, 0, 0, 0,
 		NULL,
 		NULL,
 		wndParentClass.hInstance,
-		LPVOID(res),
+		LPVOID(class_atom),
 		zbid);
 	if (!hwnd)
 	{
@@ -239,26 +296,7 @@ HWND CreateWin(HMODULE hModule, UINT zbid, const TCHAR* title, const TCHAR* clas
 
 	if (FALSE == SetWindowText(hwnd, title))
 	{
-		ShowErrorMsg(_T("SetWindowText"));
-		return nullptr;
-	}
-
-	// https://devblogs.microsoft.com/oldnewthing/20050505-04/?p=35703
-	// https://stackoverflow.com/a/5299718/1926020
-	HMONITOR hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-	MONITORINFO mi = { sizeof(mi) };
-	
-	if (0 == GetMonitorInfo(hmon, &mi))
-	{
-		ShowErrorMsg(_T("GetMonitorInfo"));
-		return nullptr;
-	}
-
-	bool test = false;
-	if (test)
-	{
-		mi.rcMonitor.left += 100;
-		mi.rcMonitor.right /= 2;
+		return FailCreatedWindow(hwnd, _T("SetWindowText"));
 	}
 
 	//HRGN hrg = CreateRoundRectRgn(
@@ -282,21 +320,20 @@ HWND CreateWin(HMODULE hModule, UINT zbid, const TCHAR* title, const TCHAR* clas
 
 	//const auto pSetBrokeredForeground = SetBrokeredForeground(GetProcAddress(hpath, MAKEINTRESOURCEA(__imp_SetBrokeredForeground)));
 	//pSetBrokeredForeground(hwnd); //Works only if the window is created in ZBID_GENUINE_WINDOWS band.
-	// 
+	//
 	//const auto pSetWindowBand = SetWindowBand(GetProcAddress(hpath, "SetWindowBand"));
 	//pSetWindowBand(hwnd, HWND_TOPMOST, ZBID_ABOVELOCK_UX); //This still doesn't in any case.
 
 	if (0 == SetWindowPos(
 		hwnd,
 		nullptr,
-		mi.rcMonitor.left,
-		mi.rcMonitor.top,
-		mi.rcMonitor.right - mi.rcMonitor.left,
-		mi.rcMonitor.bottom - mi.rcMonitor.top,
-		SWP_SHOWWINDOW | SWP_NOZORDER))
+		monitorRect.left,
+		monitorRect.top,
+		monitorRect.right - monitorRect.left,
+		monitorRect.bottom - monitorRect.top,
+		SWP_NOZORDER | SWP_NOACTIVATE))
 	{
-		ShowErrorMsg(_T("SetWindowPos"));
-		return nullptr;
+		return FailCreatedWindow(hwnd, _T("SetWindowPos"));
 	}
 
 	auto setLongRes = SetWindowLong(
@@ -305,34 +342,57 @@ HWND CreateWin(HMODULE hModule, UINT zbid, const TCHAR* title, const TCHAR* clas
 		GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE);
 	if (0 == setLongRes)
 	{
-		ShowErrorMsg(_T("SetWindowLong"));
-		return nullptr;
+		return FailCreatedWindow(hwnd, _T("SetWindowLong"));
 	}
 
-	ShowWindow(hwnd, SW_HIDE);
-	
+	// Keep the layered window fully opaque while enabling transparent click-through.
+	if (FALSE == SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA))
+	{
+		return FailCreatedWindow(hwnd, _T("SetLayeredWindowAttributes"));
+	}
+
+	// Keep the privacy overlay visible when taskbar Peek previews another window.
+	// Do not use DWMWA_CLOAK here because it hides the privacy window itself.
+	if (FAILED(SetDwmBoolWindowAttribute(hwnd, DWMWA_EXCLUDED_FROM_PEEK, TRUE)))
+	{
+		return FailCreatedWindow(hwnd, _T("SetDwmBoolWindowAttribute DWMWA_EXCLUDED_FROM_PEEK"));
+	}
+
+	if (IsWindowsVersionOrGreater(10, 0, 19041, 0, 0) == TRUE)
+	{
+		(void)SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+	}
+
 	if (FALSE == UpdateWindow(hwnd))
 	{
-		ShowErrorMsg(_T("UpdateWindow"));
-		return nullptr;
+		return FailCreatedWindow(hwnd, _T("UpdateWindow"));
 	}
 
 	return hwnd;
 }
 
-// https://github.com/killtimer0/uiaccess/issues/3#issuecomment-1787022010
-HRESULT CloakWindow(HWND hwnd, BOOL cloakHwnd) {
+HRESULT SetDwmBoolWindowAttribute(HWND hwnd, DWMWINDOWATTRIBUTE attribute, BOOL enabled) {
 	HRESULT result;
-	HMODULE hMod = LoadLibrary(TEXT("dwmapi.dll"));
+	bool loadedDwmapi = false;
+	HMODULE hMod = GetModuleHandle(TEXT("dwmapi.dll"));
+	if (!hMod) {
+		hMod = LoadLibrary(TEXT("dwmapi.dll"));
+		loadedDwmapi = hMod != nullptr;
+	}
 	if (hMod) {
-		DwmSetWindowAttribute pDwmSetWindowAttribute = (DwmSetWindowAttribute)GetProcAddress(hMod, "DwmSetWindowAttribute");
+		DwmSetWindowAttributeFunc pDwmSetWindowAttribute = (DwmSetWindowAttributeFunc)GetProcAddress(hMod, "DwmSetWindowAttribute");
 		if (pDwmSetWindowAttribute) {
-			result = pDwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloakHwnd, sizeof(cloakHwnd));
+			result = pDwmSetWindowAttribute(hwnd, attribute, &enabled, sizeof(enabled));
+			if (FAILED(result)) {
+				SetLastError(HRESULT_CODE(result));
+			}
 		}
 		else {
 			result = HRESULT_FROM_WIN32(GetLastError());
 		}
-		FreeLibrary(hMod);
+		if (loadedDwmapi) {
+			FreeLibrary(hMod);
+		}
 	}
 	else {
 		result = HRESULT_FROM_WIN32(GetLastError());
@@ -340,8 +400,285 @@ HRESULT CloakWindow(HWND hwnd, BOOL cloakHwnd) {
 	return result;
 }
 
+void DebugLogLastError(const TCHAR* caption)
+{
+	DWORD code = GetLastError();
+	TCHAR msg[512] = { 0, };
+	_sntprintf_s(msg, sizeof(msg) / sizeof(msg[0]), _TRUNCATE, _T("%s, code 0x%x\n"), caption, code);
+	OutputDebugString(msg);
+}
+
+BOOL CALLBACK EnumMonitorRectProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
+{
+	auto rects = reinterpret_cast<std::vector<RECT> *>(lParam);
+	MONITORINFO mi = { sizeof(mi) };
+	if (0 == GetMonitorInfo(hmon, &mi))
+	{
+		DebugLogLastError(_T("GetMonitorInfo"));
+		return TRUE;
+	}
+	rects->push_back(mi.rcMonitor);
+	return TRUE;
+}
+
+bool GetMonitorRects(std::vector<RECT>& rects)
+{
+	rects.clear();
+	return FALSE != EnumDisplayMonitors(nullptr, nullptr, EnumMonitorRectProc, reinterpret_cast<LPARAM>(&rects));
+}
+
+DWORD GetPrivacyWindowThreadId()
+{
+	return static_cast<DWORD>(InterlockedCompareExchange(&g_window_thread_id, 0, 0));
+}
+
+bool PostPrivacyThreadMessage(UINT message, bool reportError)
+{
+	const auto threadId = GetPrivacyWindowThreadId();
+	if (threadId == 0)
+	{
+		return false;
+	}
+	if (FALSE == PostThreadMessage(threadId, message, NULL, NULL))
+	{
+		if (reportError)
+		{
+			ShowErrorMsg(_T("PostThreadMessage"));
+		}
+		return false;
+	}
+	return true;
+}
+
+void SchedulePrivacyWindowRefresh()
+{
+	if (g_refresh_pending)
+	{
+		return;
+	}
+	g_refresh_pending = true;
+	if (!PostPrivacyThreadMessage(WM_RUSTDESK_REFRESH_WINDOWS, true))
+	{
+		g_refresh_pending = false;
+	}
+}
+
+bool RemovePrivacyWindow(HWND hwnd)
+{
+	const auto it = std::find(g_hwnds.begin(), g_hwnds.end(), hwnd);
+	if (it == g_hwnds.end())
+	{
+		return false;
+	}
+	g_hwnds.erase(it);
+	return true;
+}
+
+bool IsAnyPrivacyWindowVisible()
+{
+	for (auto hwnd : g_hwnds)
+	{
+		if (FALSE != IsWindowVisible(hwnd))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void SetPrivacyWindowsVisible(bool visible)
+{
+	g_privacy_windows_visible = visible;
+	if (!visible)
+	{
+		g_show_windows_after_refresh = false;
+	}
+	for (auto hwnd : g_hwnds)
+	{
+		ShowWindow(hwnd, visible ? SW_SHOW : SW_HIDE);
+	}
+}
+
+bool ResizePrivacyWindow(HWND hwnd, const RECT& monitorRect)
+{
+	if (0 == SetWindowPos(
+		hwnd,
+		nullptr,
+		monitorRect.left,
+		monitorRect.top,
+		monitorRect.right - monitorRect.left,
+		monitorRect.bottom - monitorRect.top,
+		SWP_NOZORDER | SWP_NOACTIVATE))
+	{
+		ShowErrorMsg(_T("SetWindowPos"));
+		return false;
+	}
+	InvalidateRect(hwnd, nullptr, TRUE);
+	return true;
+}
+
+bool DestroyPrivacyWindowsFrom(size_t begin)
+{
+	g_refreshing_windows = true;
+	bool ok = true;
+	std::vector<HWND> remaining(g_hwnds.begin(), g_hwnds.begin() + begin);
+	for (size_t i = begin; i < g_hwnds.size(); ++i)
+	{
+		const auto hwnd = g_hwnds[i];
+		if (FALSE == DestroyWindow(hwnd))
+		{
+			ShowErrorMsg(_T("DestroyWindow"));
+			ok = false;
+			if (FALSE != IsWindow(hwnd))
+			{
+				remaining.push_back(hwnd);
+			}
+		}
+	}
+	g_refreshing_windows = false;
+	g_hwnds.swap(remaining);
+	return ok;
+}
+
+HWND FailCreatedWindow(HWND hwnd, const TCHAR* caption)
+{
+	ShowErrorMsg(caption);
+	if (hwnd)
+	{
+		const auto wasRefreshing = g_refreshing_windows;
+		g_refreshing_windows = true;
+		DestroyWindow(hwnd);
+		g_refreshing_windows = wasRefreshing;
+	}
+	return nullptr;
+}
+
+bool CreatePrivacyWindows(HMODULE hModule, UINT zbid, bool showWindows)
+{
+	std::vector<RECT> monitorRects;
+	if (!GetMonitorRects(monitorRects))
+	{
+		ShowErrorMsg(_T("EnumDisplayMonitors"));
+		return false;
+	}
+	if (monitorRects.empty())
+	{
+		return false;
+	}
+
+	const auto createdBegin = g_hwnds.size();
+	for (const auto& monitorRect : monitorRects)
+	{
+		auto hwnd = CreateWin(hModule, zbid, WindowTitle, ClassName, monitorRect);
+		if (!hwnd)
+		{
+			(void)DestroyPrivacyWindowsFrom(createdBegin);
+			return false;
+		}
+		if (showWindows)
+		{
+			ShowWindow(hwnd, SW_SHOW);
+		}
+		g_hwnds.push_back(hwnd);
+	}
+	return true;
+}
+
+bool RefreshPrivacyWindows(HMODULE hModule, UINT zbid)
+{
+	if (g_shutting_down_windows)
+	{
+		return true;
+	}
+
+	std::vector<RECT> monitorRects;
+	if (!GetMonitorRects(monitorRects))
+	{
+		ShowErrorMsg(_T("EnumDisplayMonitors"));
+		return false;
+	}
+	if (monitorRects.empty())
+	{
+		return false;
+	}
+
+	const bool showWindows = g_show_windows_after_refresh || g_privacy_windows_visible || IsAnyPrivacyWindowVisible();
+	const auto createdBegin = g_hwnds.size();
+	for (size_t i = 0; i < monitorRects.size(); ++i)
+	{
+		if (i < g_hwnds.size())
+		{
+			if (!ResizePrivacyWindow(g_hwnds[i], monitorRects[i]))
+			{
+				return false;
+			}
+			continue;
+		}
+
+		auto hwnd = CreateWin(hModule, zbid, WindowTitle, ClassName, monitorRects[i]);
+		if (!hwnd)
+		{
+			(void)DestroyPrivacyWindowsFrom(createdBegin);
+			return false;
+		}
+		if (showWindows)
+		{
+			ShowWindow(hwnd, SW_SHOW);
+		}
+		g_hwnds.push_back(hwnd);
+	}
+
+	if (g_hwnds.size() > monitorRects.size())
+	{
+		const bool ok = DestroyPrivacyWindowsFrom(monitorRects.size());
+		if (ok)
+		{
+			g_show_windows_after_refresh = false;
+		}
+		return ok;
+	}
+	g_show_windows_after_refresh = false;
+	return true;
+}
+
+bool HandlePrivacyThreadMessage(UINT message)
+{
+	switch (message)
+	{
+	case WM_RUSTDESK_REFRESH_WINDOWS:
+		g_refresh_pending = false;
+		(void)RefreshPrivacyWindows(g_module, g_zbid);
+		return true;
+	case WM_RUSTDESK_SHOW_WINDOWS:
+		SetPrivacyWindowsVisible(true);
+		return true;
+	case WM_RUSTDESK_HIDE_WINDOWS:
+		SetPrivacyWindowsVisible(false);
+		return true;
+	case WM_RUSTDESK_SHUTDOWN_WINDOWS:
+		g_shutting_down_windows = true;
+		(void)DestroyPrivacyWindowsFrom(0);
+		PostQuitMessage(0);
+		return true;
+	default:
+		return false;
+	}
+}
+
+DWORD FinishPrivacyThread(DWORD result)
+{
+	InterlockedExchange(&g_window_thread_id, 0);
+	return result;
+}
+
 DWORD WINAPI UwU(LPVOID lpParam)
 {
+	g_module = reinterpret_cast<HMODULE>(lpParam);
+
+	MSG msg;
+	PeekMessage(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+	InterlockedExchange(&g_window_thread_id, GetCurrentThreadId());
+
 #ifdef WINDOWINJECTION_EXPORTS
 	auto initRes = g_bitmapLoader.Initialize(true);
 #else
@@ -350,39 +687,10 @@ DWORD WINAPI UwU(LPVOID lpParam)
 	if (EBitmapLoader::kOk != initRes)
 	{
 		ShowBitmapLoaderErrorMsg(_T("Initialize"), initRes, g_bitmapLoader.GetLastErrMsg());
-		return 0;
+		return FinishPrivacyThread(0);
 	}
 
-#ifdef WINDOWINJECTION_EXPORTS
-	g_hwnd = CreateWin(NULL, ZBID_ABOVELOCK_UX, WindowTitle, ClassName);
-#else
-	g_hwnd = CreateWin(NULL, ZBID_DESKTOP, WindowTitle, ClassName);
-#endif
-	if (!g_hwnd)
-	{
-		return 0;
-	}
-
-	(void)CloakWindow(g_hwnd, TRUE);
-	// Hard code "exclude from capture"
-	if (IsWindowsVersionOrGreater(10, 0, 19041, 0, 0) == TRUE)
-	{
-		(void)SetWindowDisplayAffinity(g_hwnd, WDA_EXCLUDEFROMCAPTURE);
-	}
-
-	RECT rcClient;
-	if (FALSE == GetClientRect(g_hwnd, &rcClient))
-	{
-#ifdef WINDOWINJECTION_EXPORTS
-		MessageBox(NULL, _T("Failed to GetClientRect"), _T("BitmapLoader"), 0);
-#else
-		_tprintf(_T("BitmapLoader: Failed to GetClientRect\n"));
-#endif
-		return 0;
-	}
-
-	long rect[4] = { rcClient.left, rcClient.top, rcClient.right, rcClient.bottom};
-
+	long rect[4] = { 0, 0, PRIVACY_BITMAP_WIDTH, PRIVACY_BITMAP_HEIGHT };
 	auto DIBres = EBitmapLoader::kErrUnknown;
 	if (g_loadFromMemory)
 	{
@@ -398,21 +706,38 @@ DWORD WINAPI UwU(LPVOID lpParam)
 	if (EBitmapLoader::kOk != DIBres)
 	{
 		ShowBitmapLoaderErrorMsg(_T("CreateDIBFromFile"), DIBres, g_bitmapLoader.GetLastErrMsg());
-		return 0;
+		return FinishPrivacyThread(0);
+	}
+
+#ifdef WINDOWINJECTION_EXPORTS
+	g_zbid = ZBID_ABOVELOCK_UX;
+#else
+	g_zbid = ZBID_DESKTOP;
+#endif
+
+	if (!CreatePrivacyWindows(g_module, g_zbid, false))
+	{
+		return FinishPrivacyThread(0);
 	}
 
 #ifndef WINDOWINJECTION_EXPORTS
-	ShowWindow(g_hwnd, SW_SHOW);
+	for (auto hwnd : g_hwnds)
+	{
+		ShowWindow(hwnd, SW_SHOW);
+	}
 #endif
 
-	MSG msg;
 	while (GetMessage(&msg, nullptr, 0, 0))
 	{
+		if (HandlePrivacyThreadMessage(msg.message))
+		{
+			continue;
+		}
 		TranslateMessage(&msg);
 		DispatchMessage(&msg);
 	}
 
-	return 0;
+	return FinishPrivacyThread(0);
 }
 
 void OnPaintGdi(HWND hwnd, HDC hdc)
@@ -475,16 +800,29 @@ VOID OnPaintGdiPlus(HWND hwnd, HDC hdc)
 	auto bitmap = g_bitmapLoader.GetBitmap();
 	if (bitmap)
 	{
-		// Create rendering area
-		Gdiplus::SizeF sizef = Gdiplus::SizeF(
-			(Gdiplus::REAL)bitmap->GetWidth(),
-			(Gdiplus::REAL)bitmap->GetHeight());
+		RECT rcClient;
+		if (FALSE == GetClientRect(hwnd, &rcClient))
+		{
+			return;
+		}
 
-		Gdiplus::RectF rcClient = Gdiplus::RectF(Gdiplus::PointF(0, 0), sizef);
-
-		// Render the Bitmap
 		Gdiplus::Graphics graphics(hdc);
-		graphics.DrawImage(bitmap, rcClient);
+		graphics.Clear(Gdiplus::Color::Black);
+
+		const auto client_w = static_cast<Gdiplus::REAL>(rcClient.right - rcClient.left);
+		const auto client_h = static_cast<Gdiplus::REAL>(rcClient.bottom - rcClient.top);
+		const auto bmp_w = static_cast<Gdiplus::REAL>(bitmap->GetWidth());
+		const auto bmp_h = static_cast<Gdiplus::REAL>(bitmap->GetHeight());
+		const auto scale_w = client_w / bmp_w;
+		const auto scale_h = client_h / bmp_h;
+		const auto scale = scale_w < scale_h ? scale_w : scale_h;
+		const auto dest_w = bmp_w * scale;
+		const auto dest_h = bmp_h * scale;
+		const auto dest_x = (client_w - dest_w) / 2.0f;
+		const auto dest_y = (client_h - dest_h) / 2.0f;
+		const Gdiplus::RectF dest = Gdiplus::RectF(dest_x, dest_y, dest_w, dest_h);
+
+		graphics.DrawImage(bitmap, dest);
 	}
 }
 
@@ -498,7 +836,22 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ulReasonForCall, LPVOID lpReserved
 	{
 	case DLL_PROCESS_ATTACH:
 		// Initialize once for each new process.
-		CreateThread(nullptr, 0, UwU, hModule, NULL, NULL);
+		{
+			if (FALSE == DisableThreadLibraryCalls(hModule))
+			{
+				DebugLogLastError(_T("DisableThreadLibraryCalls"));
+			}
+
+			HANDLE thread = CreateThread(nullptr, 0, UwU, hModule, NULL, NULL);
+			if (thread)
+			{
+				CloseHandle(thread);
+			}
+			else
+			{
+				DebugLogLastError(_T("CreateThread"));
+			}
+		}
 		break;
 	case DLL_THREAD_ATTACH:
 		// Do thread-specific initialization.
@@ -508,9 +861,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ulReasonForCall, LPVOID lpReserved
 		break;
 	case DLL_PROCESS_DETACH:
 		// Perform any necessary cleanup.
-		if (g_hwnd)
+		if (lpReserved == nullptr)
 		{
-			PostMessage(g_hwnd, WM_CLOSE, NULL, NULL);
+			// Dynamic FreeLibrary unload is best-effort only. RustDesk tears
+			// this broker down by terminating the host process, and waiting
+			// here would run under the loader lock.
+			(void)PostPrivacyThreadMessage(WM_RUSTDESK_SHUTDOWN_WINDOWS, false);
 		}
 		break;
 	default:
@@ -524,14 +880,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ulReasonForCall, LPVOID lpReserved
 
 int main(int argc, char* argv[])
 {
-	HMODULE hInstance = nullptr;
-    BOOL result =
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<char*>(&DefWindowProc), &hInstance);
-	if (FALSE == result)
+	HMODULE hInstance = GetModuleHandle(nullptr);
+	if (!hInstance)
 	{
-		printf("Failed to GetModuleHandleExA, 0x%x\n", GetLastError());
+		printf("Failed to GetModuleHandle, 0x%x\n", GetLastError());
 		return 0;
 	}
 
