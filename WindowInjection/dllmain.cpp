@@ -415,7 +415,7 @@ BOOL CALLBACK EnumMonitorRectProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
 	if (0 == GetMonitorInfo(hmon, &mi))
 	{
 		DebugLogLastError(_T("GetMonitorInfo"));
-		return TRUE;
+		return FALSE;
 	}
 	rects->push_back(mi.rcMonitor);
 	return TRUE;
@@ -863,9 +863,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ulReasonForCall, LPVOID lpReserved
 		// Perform any necessary cleanup.
 		if (lpReserved == nullptr)
 		{
-			// Dynamic FreeLibrary unload is best-effort only. RustDesk tears
-			// this broker down by terminating the host process, and waiting
-			// here would run under the loader lock.
+			// Dynamic FreeLibrary unload is unsupported and best-effort only.
+			// RustDesk tears this broker down by terminating the host process,
+			// and waiting for the privacy thread here would run under the loader lock.
 			(void)PostPrivacyThreadMessage(WM_RUSTDESK_SHUTDOWN_WINDOWS, false);
 		}
 		break;
