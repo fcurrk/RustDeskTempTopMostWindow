@@ -5,6 +5,7 @@
 #include <vector>
 #include <iostream>
 #include <thread>
+#include <chrono>
 
 #pragma comment(lib, "shlwapi.lib")
 
@@ -96,6 +97,26 @@ const TCHAR* WindowTitle = _T("RustDeskPrivacyWindow");
 const TCHAR* WindowClass = _T("RustDeskPrivacyWindowClass");
 constexpr UINT WM_RUSTDESK_SHOW_WINDOWS = WM_APP + 3;
 constexpr UINT WM_RUSTDESK_HIDE_WINDOWS = WM_APP + 4;
+constexpr int PrivacyWindowPollAttempts = 50;
+constexpr int PrivacyWindowPollIntervalMs = 100;
+
+BOOL CALLBACK CountMonitorProc(HMONITOR, HDC, LPRECT, LPARAM data)
+{
+	auto count = reinterpret_cast<int*>(data);
+	++(*count);
+	return TRUE;
+}
+
+int GetMonitorCount()
+{
+	int count = 0;
+	if (FALSE == EnumDisplayMonitors(NULL, NULL, CountMonitorProc, reinterpret_cast<LPARAM>(&count)))
+	{
+		PrintError(_T("EnumDisplayMonitors"));
+		return 0;
+	}
+	return count;
+}
 
 std::vector<HWND> FindPrivacyWindows(DWORD processId)
 {
@@ -132,6 +153,20 @@ bool PostPrivacyWindowsVisible(const std::vector<HWND>& hwnds, bool visible)
 		}
 	}
 	return ok;
+}
+
+std::vector<HWND> WaitForPrivacyWindows(DWORD processId, size_t expectedCount)
+{
+	for (int i = 0; i < PrivacyWindowPollAttempts; ++i)
+	{
+		auto hwnds = FindPrivacyWindows(processId);
+		if (hwnds.size() >= expectedCount)
+		{
+			return hwnds;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(PrivacyWindowPollIntervalMs));
+	}
+	return {};
 }
 
 bool StartInjectedBroker(const TCHAR* path, PROCESS_INFORMATION& procInfo)
@@ -203,21 +238,35 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 
-	std::this_thread::sleep_for(std::chrono::milliseconds(1 * 1000));
-	auto hwnds = FindPrivacyWindows(procInfo.dwProcessId);
+	const int monitorCount = GetMonitorCount();
+	if (monitorCount <= 0)
+	{
+		StopInjectedBroker(procInfo);
+		return 1;
+	}
+
+	auto hwnds = WaitForPrivacyWindows(procInfo.dwProcessId, static_cast<size_t>(monitorCount));
 	if (hwnds.empty())
 	{
-		PrintError(_T("FindWindow"));
+		_tprintf(_T("Failed FindPrivacyWindows, timed out waiting for %d privacy windows\n"), monitorCount);
 		StopInjectedBroker(procInfo);
 		return 1;
 	}
 
 	printf("now hide window\n");
-	(void)PostPrivacyWindowsVisible(hwnds, false);
+	if (!PostPrivacyWindowsVisible(hwnds, false))
+	{
+		StopInjectedBroker(procInfo);
+		return 1;
+	}
 	std::this_thread::sleep_for(std::chrono::milliseconds(1 * 1000));
 
 	printf("now show window\n");
-	(void)PostPrivacyWindowsVisible(hwnds, true);
+	if (!PostPrivacyWindowsVisible(hwnds, true))
+	{
+		StopInjectedBroker(procInfo);
+		return 1;
+	}
 	std::this_thread::sleep_for(std::chrono::milliseconds(1 * 1000));
 
 	std::this_thread::sleep_for(std::chrono::milliseconds(5 * 1000));
