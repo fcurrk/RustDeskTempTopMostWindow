@@ -91,12 +91,6 @@ jobs:
           copy (Find-RuntimeDll "vcruntime140.dll") ${{ env.dist_dir }}
           copy (Find-RuntimeDll "vcruntime140_1.dll") ${{ env.dist_dir }}
 
-          $installPath = & $vswherePath -latest -requires Microsoft.Component.MSBuild -property installationPath
-          if ([string]::IsNullOrWhiteSpace($installPath)) {
-            Write-Error "Unable to locate Visual Studio installation path"
-            exit 1
-          }
-
           Get-ChildItem ${{ env.dist_dir }} -Recurse -File | ForEach-Object {$filePath = $_.FullName; Write-Output "$($(Get-FileHash -Algorithm SHA256 -Path $filePath).Hash) $filePath" }
           Compress-Archive -Path ${{ env.dist_dir }}/* -Destination ${{ env.dist_file }}
           md5sum ${{ env.dist_file }} | tee ${{ env.dist_file }}.checksum_md5
