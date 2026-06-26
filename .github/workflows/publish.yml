@@ -7,7 +7,7 @@ on:
             description: 'Target'
             required: true
             type: string
-            default: 'windows-2019'
+            default: 'windows-2022'
         configuration:
             description: 'Configuration'
             required: true
@@ -23,6 +23,10 @@ on:
             required: true
             type: string
             default: 'Windows10'
+
+concurrency:
+  group: topmostwindow-release-${{ inputs.platform }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -46,7 +50,7 @@ jobs:
       - name: Download Artifact
         uses: actions/download-artifact@v4
         with:
-          name: topmostwindow-artifacts
+          name: topmostwindow-artifacts-${{ inputs.platform }}
           path: .
 
       - name: Publish Release

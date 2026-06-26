@@ -5,6 +5,7 @@
 #include <vector>
 #include <iostream>
 #include <thread>
+#include <chrono>
 
 #pragma comment(lib, "shlwapi.lib")
 
@@ -92,6 +93,133 @@ BOOL GetExecutableDir(TCHAR* dir, int maxLen)
 
 typedef BOOL(WINAPI* SetWindowBand)(HWND hWnd, HWND hwndInsertAfter, DWORD dwBand);
 
+const TCHAR* WindowTitle = _T("RustDeskPrivacyWindow");
+const TCHAR* WindowClass = _T("RustDeskPrivacyWindowClass");
+constexpr UINT WM_RUSTDESK_SHOW_WINDOWS = WM_APP + 3;
+constexpr UINT WM_RUSTDESK_HIDE_WINDOWS = WM_APP + 4;
+constexpr int PrivacyWindowPollAttempts = 50;
+constexpr int PrivacyWindowPollIntervalMs = 100;
+
+BOOL CALLBACK CountMonitorProc(HMONITOR, HDC, LPRECT, LPARAM data)
+{
+	auto count = reinterpret_cast<int*>(data);
+	++(*count);
+	return TRUE;
+}
+
+int GetMonitorCount()
+{
+	int count = 0;
+	if (FALSE == EnumDisplayMonitors(NULL, NULL, CountMonitorProc, reinterpret_cast<LPARAM>(&count)))
+	{
+		PrintError(_T("EnumDisplayMonitors"));
+		return 0;
+	}
+	return count;
+}
+
+std::vector<HWND> FindPrivacyWindows(DWORD processId)
+{
+	std::vector<HWND> hwnds;
+	HWND after = NULL;
+	for (;;)
+	{
+		HWND hwnd = FindWindowEx(NULL, after, WindowClass, WindowTitle);
+		if (hwnd == NULL)
+		{
+			break;
+		}
+		DWORD windowProcessId = 0;
+		GetWindowThreadProcessId(hwnd, &windowProcessId);
+		if (windowProcessId == processId)
+		{
+			hwnds.push_back(hwnd);
+		}
+		after = hwnd;
+	}
+	return hwnds;
+}
+
+bool PostPrivacyWindowsVisible(const std::vector<HWND>& hwnds, bool visible)
+{
+	const UINT message = visible ? WM_RUSTDESK_SHOW_WINDOWS : WM_RUSTDESK_HIDE_WINDOWS;
+	bool ok = true;
+	for (auto hwnd : hwnds)
+	{
+		if (FALSE == PostMessage(hwnd, message, NULL, NULL))
+		{
+			PrintError(_T("PostMessage"));
+			ok = false;
+		}
+	}
+	return ok;
+}
+
+std::vector<HWND> WaitForPrivacyWindows(DWORD processId, size_t expectedCount)
+{
+	for (int i = 0; i < PrivacyWindowPollAttempts; ++i)
+	{
+		auto hwnds = FindPrivacyWindows(processId);
+		if (hwnds.size() >= expectedCount)
+		{
+			return hwnds;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(PrivacyWindowPollIntervalMs));
+	}
+	return {};
+}
+
+bool StartInjectedBroker(const TCHAR* path, PROCESS_INFORMATION& procInfo)
+{
+	STARTUPINFO startInfo = { 0 };
+
+	//TCHAR cmdline[MAX_PATH] = { 0, };
+	// _sntprintf_s(cmdline, sizeof(cmdline) / sizeof(cmdline[0]), _TRUNCATE, _T("%s\\MiniBroker.exe"), dir);
+	TCHAR cmdline[] = L"C:\\Windows\\System32\\RuntimeBroker.exe";
+
+	startInfo.cb = sizeof(startInfo);
+
+	if (!CreateProcess(nullptr, cmdline, nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &startInfo, &procInfo))
+	{
+		PrintError(_T("CreateProcess"));
+		return false;
+	}
+
+	if (FALSE == InjectDll(procInfo.hProcess, procInfo.hThread, path))
+	{
+		return false;
+	}
+
+	if (0xffffffff == ResumeThread(procInfo.hThread))
+	{
+		PrintError(_T("ResumeThread"));
+		return false;
+	}
+	return true;
+}
+
+void StopInjectedBroker(PROCESS_INFORMATION& procInfo)
+{
+	if (procInfo.hProcess != NULL)
+	{
+		if (FALSE == TerminateProcess(procInfo.hProcess, 0))
+		{
+			PrintError(_T("TerminateProcess"));
+		}
+		else
+		{
+			WaitForSingleObject(procInfo.hProcess, 5 * 1000);
+		}
+		CloseHandle(procInfo.hProcess);
+		procInfo.hProcess = NULL;
+	}
+	if (procInfo.hThread != NULL)
+	{
+		CloseHandle(procInfo.hThread);
+		procInfo.hThread = NULL;
+	}
+}
+
 int main(int argc, char* argv[])
 {
 	TCHAR dir[MAX_PATH] = { 0, };
@@ -103,46 +231,47 @@ int main(int argc, char* argv[])
 	TCHAR path[MAX_PATH] = { 0, };
 	_sntprintf_s(path, sizeof(path) / sizeof(path[0]), _TRUNCATE, _T("%s\\WindowInjection.dll"), dir);
 
-	STARTUPINFO startInfo = { 0 };
 	PROCESS_INFORMATION procInfo = { 0 };
-
-	//TCHAR cmdline[MAX_PATH] = { 0, };
-	// _sntprintf_s(cmdline, sizeof(cmdline) / sizeof(cmdline[0]), _TRUNCATE, _T("%s\\MiniBroker.exe"), dir);
-	TCHAR cmdline[] = L"C:\\Windows\\System32\\RuntimeBroker.exe";
-
-	startInfo.cb = sizeof(startInfo);
-
-	if (CreateProcess(nullptr, cmdline, nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &startInfo, &procInfo))
+	if (!StartInjectedBroker(path, procInfo))
 	{
-		(VOID)InjectDll(procInfo.hProcess, procInfo.hThread, path);
-		ResumeThread(procInfo.hThread);
-	}
-	else
-	{
-		PrintError(_T("CreateProcess"));
+		StopInjectedBroker(procInfo);
+		return 1;
 	}
 
+	const int monitorCount = GetMonitorCount();
+	if (monitorCount <= 0)
+	{
+		StopInjectedBroker(procInfo);
+		return 1;
+	}
+
+	auto hwnds = WaitForPrivacyWindows(procInfo.dwProcessId, static_cast<size_t>(monitorCount));
+	if (hwnds.empty())
+	{
+		_tprintf(_T("Failed FindPrivacyWindows, timed out waiting for %d privacy windows\n"), monitorCount);
+		StopInjectedBroker(procInfo);
+		return 1;
+	}
+
+	printf("now hide window\n");
+	if (!PostPrivacyWindowsVisible(hwnds, false))
+	{
+		StopInjectedBroker(procInfo);
+		return 1;
+	}
 	std::this_thread::sleep_for(std::chrono::milliseconds(1 * 1000));
-	const TCHAR* WindowTitle = _T("RustDeskPrivacyWindow");
-	HWND hwnd = FindWindow(NULL, WindowTitle);
-	if (hwnd == NULL)
-	{
-		PrintError(_T("FindWindow"));
-	}
-	else
-	{
-		printf("now hide window\n");
-		ShowWindow(hwnd, SW_HIDE);
-		std::this_thread::sleep_for(std::chrono::milliseconds(1 * 1000));
 
-		printf("now show window\n");
-		ShowWindow(hwnd, SW_SHOW);
-		std::this_thread::sleep_for(std::chrono::milliseconds(1 * 1000));
-
-		std::this_thread::sleep_for(std::chrono::milliseconds(5 * 1000));
-		printf("now destroy window\n");
-		PostMessage(hwnd, WM_CLOSE, NULL, NULL);
+	printf("now show window\n");
+	if (!PostPrivacyWindowsVisible(hwnds, true))
+	{
+		StopInjectedBroker(procInfo);
+		return 1;
 	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(1 * 1000));
+
+	std::this_thread::sleep_for(std::chrono::milliseconds(5 * 1000));
+	printf("now destroy window\n");
+	StopInjectedBroker(procInfo);
 
 	return 0;
 }
