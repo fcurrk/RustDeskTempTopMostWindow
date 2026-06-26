@@ -2,10 +2,6 @@ name: ci
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-
 jobs:
   build_publish:
     uses: ./.github/workflows/publish.yml
