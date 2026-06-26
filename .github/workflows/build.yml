@@ -1,28 +1,50 @@
 name: build
 
 on:
-  workflow_call:
+  workflow_dispatch:  # 保留手动触发
     inputs:
-        target:
-            description: 'Target'
-            required: true
-            type: string
-            default: 'windows-2022'
-        configuration:
-            description: 'Configuration'
-            required: true
-            type: string
-            default: 'Release'
-        platform:
-            description: 'Platform'
-            required: true
-            type: string
-            default: 'x64'
-        target_version:
-            description: 'TargetVersion'
-            required: true
-            type: string
-            default: 'Windows10'
+      target:
+        description: 'Target'
+        required: true
+        type: string
+        default: 'windows-2022'
+      configuration:
+        description: 'Configuration'
+        required: true
+        type: string
+        default: 'Release'
+      platform:
+        description: 'Platform'
+        required: true
+        type: string
+        default: 'x64'
+      target_version:
+        description: 'TargetVersion'
+        required: true
+        type: string
+        default: 'Windows10'
+  workflow_call:  # 新增：允许被其他工作流调用
+    inputs:       # 可选：定义被调用时可传入的参数
+      target:
+        description: 'Target'
+        required: true
+        type: string
+        default: 'windows-2022'
+      configuration:
+        description: 'Configuration'
+        required: true
+        type: string
+        default: 'Release'
+      platform:
+        description: 'Platform'
+        required: true
+        type: string
+        default: 'x64'
+      target_version:
+        description: 'TargetVersion'
+        required: true
+        type: string
+        default: 'Windows10'
 
 env:
   solution_path: TempTopMostWindow.sln
